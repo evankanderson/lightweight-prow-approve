@@ -28,3 +28,15 @@ severe than others:
     **must** be a maintainer, even if the first set of eyes was from a
     maintainer. In practice, this means that non-maintainers can't do useful
     reviews, and increases the load on existing maintainers.
+
+## Current Status
+
+Not working -- currently working on fetch the PR data and reading the OWNERS files
+out of the repo.
+
+## How it should work:
+
+For each PR, we collect the set of authors and files touched, and then compute
+which files the authors are already OWNERS on. We then collect the set of OWNERS
+for any remaining files, and return the list. We also check that there is at
+least one non-author approval on the PR (TODO).
