@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/drone/go-scm/scm"
+	"github.com/drone/go-scm/scm/driver/github"
 	"github.com/forensicanalysis/gitfs"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -16,12 +20,16 @@ import (
 )
 
 func main() {
-	pr, err := GetPullRequest()
+	prNum, err := strconv.Atoi(os.Args[1])
+	if err != nil {
+		fmt.Printf("Could not parse PR number %q: %s", os.Args[1], err)
+	}
+	pr, err := GetPullRequest(os.Getenv("GITHUB_REPOSITORY"), prNum)
 	if err != nil {
 		fmt.Println("Failed to get pull request:", err)
 		os.Exit(1)
 	}
-	gitRepo, err := GitRepoFS()
+	gitRepo, err := GitRepoFS(pr)
 	if err != nil {
 		fmt.Println("Failed to load git repo:", err)
 		os.Exit(2)
@@ -32,6 +40,8 @@ func main() {
 		fmt.Println("Failed to find ownership, error:", err)
 		os.Exit(1)
 	}
+	fmt.Println("Checking", pr)
+
 	if len(req.NeedsApprove) == 0 {
 		fmt.Println("Hello, world, all is okay!")
 	} else {
@@ -41,20 +51,62 @@ func main() {
 
 // A simplified PullRequest -- a set of file paths and the author(s) of the PR.
 type PullRequest struct {
+	Server string
+	Repo   string
+	Id     int
+
 	Files sets.String
 
-	Authors sets.String
+	Author string
 }
 
-func GetPullRequest() (PullRequest, error) {
-	return PullRequest{
-		Files: sets.NewString("foo.go", "bar.go"),
-	}, nil
+func (pr PullRequest) String() string {
+	preamble := []string{fmt.Sprintf("PR #%d: %d files (%s):", pr.Id, len(pr.Files), pr.Author)}
+	return strings.Join(append(preamble, pr.Files.List()...), "\n - ")
 }
 
-func GitRepoFS() (fs.FS, error) {
+func GetPullRequest(repo string, pull int) (PullRequest, error) {
+	retval := PullRequest{
+		Server: "github.com",
+		Repo:   repo,
+		Id:     pull,
+		Files:  sets.NewString(),
+	}
+	client, err := github.New("https://api.github.com")
+	if err != nil {
+		return retval, err
+	}
+	ctx := context.Background()
+
+	pr, resp, err := client.PullRequests.Find(ctx, retval.Repo, retval.Id)
+	if err != nil {
+		return retval, err
+	}
+	retval.Author = pr.Author.Login
+
+	// TODO: paging
+	opts := scm.ListOptions{
+		Page: 0,
+		Size: 100,
+	}
+	files, resp, err := client.PullRequests.ListChanges(ctx, retval.Repo, retval.Id, opts)
+	if err != nil {
+		return retval, err
+	}
+	if resp.Page.Last > opts.Page {
+		fmt.Printf("More than %d results, only rendering pages %d of %d\n", len(files), opts.Page, resp.Page.Last)
+	}
+	for _, change := range files {
+		retval.Files.Insert(change.Path)
+	}
+
+	return retval, nil
+}
+
+func GitRepoFS(pr PullRequest) (fs.FS, error) {
+	url := fmt.Sprintf("https://%s/%s.git", pr.Server, pr.Repo)
 	return gitfs.NewWithOptions(&git.CloneOptions{
-		URL:           os.Getenv("GITHUB_REPOSITORY"),
+		URL:           url,
 		ReferenceName: plumbing.NewBranchReferenceName(os.Getenv("GITHUB_BASE_REF")),
 		// TODO: auth
 		SingleBranch: true,
@@ -81,10 +133,10 @@ type Options struct {
 }
 
 type OwnersFile struct {
-	Options Options `json:"options,omitempty"`
-	Config  `json:",inline"`
+	Options Options `yaml:"options,omitempty"`
+	Config  `yaml:",inline"`
 	// Additional reviewers, mapping Regex pattern to *additional* Config
-	Filters map[string]Config `json:"filters,omitempty"`
+	Filters map[string]Config `yaml:"filters,omitempty"`
 }
 
 // RequiredOwners considers a PullRequest in the context of a git repo represented by an fs,
@@ -110,10 +162,12 @@ func RequiredOwners(pr PullRequest, gitFs fs.FS) (*ReviewRequirement, error) {
 		return nil, err
 	}
 
-	if pr.Authors.HasAny(ownersFile.Approvers...) {
-		result.NeedsReview = pr.Files
-		result.NeedsApprove = nil
-		return &result, nil
+	for _, a := range ownersFile.Approvers {
+		if pr.Author == a {
+			result.NeedsReview = pr.Files
+			result.NeedsApprove = nil
+			return &result, nil
+		}
 	}
 
 	for f := range pr.Files {
@@ -126,7 +180,14 @@ func RequiredOwners(pr PullRequest, gitFs fs.FS) (*ReviewRequirement, error) {
 			// TODO: complain
 			continue
 		}
-		if pr.Authors.HasAny(config.Approvers...) {
+		authorIsApprover := false
+		for _, a := range config.Approvers {
+			if pr.Author == a {
+				authorIsApprover = true
+				break
+			}
+		}
+		if authorIsApprover {
 			for file := range result.NeedsApprove {
 				if re.MatchString(file) {
 					result.NeedsReview.Insert(file)
@@ -157,7 +218,7 @@ func RequiredOwners(pr PullRequest, gitFs fs.FS) (*ReviewRequirement, error) {
 			if err != nil {
 				return nil, err
 			}
-			res, err := RequiredOwners(PullRequest{Files: files, Authors: pr.Authors}, subDir)
+			res, err := RequiredOwners(PullRequest{Files: files, Author: pr.Author}, subDir)
 			if err != nil {
 				return nil, err
 			}

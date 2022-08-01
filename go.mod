@@ -3,6 +3,7 @@ module github.com/evankanderson/lightweight-prow-approve
 go 1.18
 
 require (
+	github.com/drone/go-scm v1.27.0
 	github.com/forensicanalysis/gitfs v0.2.0
 	github.com/go-git/go-git/v5 v5.4.2
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b
